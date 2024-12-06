@@ -1,4 +1,4 @@
-module github.com/leebrotherston/onetcache
+module github.com/leebrotherston/gonetcache
 
 go 1.23.3
 
