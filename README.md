@@ -45,3 +45,43 @@ Finally we can use the cache to perform lookups:
     result := myCache.Lookup(ipaddr)
 ```
 `result` will be the type `maxminddb.Result` as this was defined earlier
+
+## Cache Statistics
+
+The cache provides statistics about its operation that can be accessed via the `GetStats()` method:
+
+## Performance Characteristics
+
+gonetcache is optimized for:
+- High concurrent access with minimal lock contention
+- Efficient subnet-based caching
+- Fast cache hits with async LRU updates
+
+### Performance Considerations
+
+1. Cache Size:
+   - Recommended size: 100-1000 entries depending on subnet distribution
+   - Memory usage: O(n) where n is cache size
+   - Each entry stores network prefix and value
+
+2. Thread Safety:
+   - Read operations use RWMutex for minimum contention
+   - Cache hits are lock-free after initial read
+   - LRU updates are performed asynchronously
+
+3. Time Complexity:
+   - Cache hit: O(log n) for IP lookup
+   - Cache miss: O(log n) + getter function cost
+   - LRU update: O(1)
+
+4. Memory Usage:
+   ```go
+   totalMemory ≈ cacheSize * (
+       sizeof(entry) +
+       sizeof(net.IPNet) +
+       sizeof(T) +
+       overhead
+   )
+   ```
+
+### Benchmarks

@@ -2,12 +2,16 @@ package gonetcache
 
 import (
 	"fmt"
+	"log"
 	"net"
 	"net/netip"
 	"sync"
+	"sync/atomic"
 
 	"github.com/leebrotherston/twinshrubnet"
 )
+
+const numShards = 32 // Must be power of 2
 
 type UserSuppliedType[T any] any
 
@@ -21,43 +25,60 @@ type cacheEntry[T any] struct {
 	entryid int // just a way to track movement in the cache when debugging
 }
 
+type CacheStats struct {
+	Hits      uint64
+	Misses    uint64
+	Evictions uint64
+}
+
 type NetCache[T any] struct {
 	cacheTree   *twinshrubnet.TreeRoot[*cacheEntry[T]]
 	cacheTop    *cacheEntry[T]
 	cacheBottom *cacheEntry[T]
-	mutex       *sync.RWMutex // This can probably be made more granular, but for now going to keep it easy and just lock the cache temporarily
+	mutex       *sync.RWMutex
 	Getter      func(netip.Addr) (T, *net.IPNet)
+	stats       CacheStats
+	maxSize     int
 }
 
-// New creates a new MMDB cache, mmdbFile is the filename for your mmdb file,
-// cacheSize is the number of networks (not IPs) to cache
 func New[T any](getter func(netip.Addr) (T, *net.IPNet), cacheSize int) (*NetCache[T], error) {
-	var (
-		newCache NetCache[T]
-	)
+	var newCache NetCache[T]
 
 	if cacheSize == 0 {
 		return nil, fmt.Errorf("cannot have cache size of 0")
 	}
 
 	newCache.cacheTree = twinshrubnet.NewTree[*cacheEntry[T]]()
-
-	newCache.cacheTop = new(cacheEntry[T])
-	prev := newCache.cacheTop
-	prev.entryid = 0
-	for x := 1; x < cacheSize; x++ {
-		// Point the previous entry's `next` to this
-		prev.next = new(cacheEntry[T])
-		prev.next.entryid = x
-		// Point this entry's `prev` to prev
-		prev.next.prev = prev
-		// Repoint prev for the next itteration
-		prev = prev.next
-	}
-	// And set the bottom of the cache
-	newCache.cacheBottom = prev
 	newCache.mutex = new(sync.RWMutex)
 	newCache.Getter = getter
+	newCache.maxSize = cacheSize
+
+	// Create first entry
+	firstEntry := &cacheEntry[T]{
+		entryid: 0,
+		prev:    nil,
+		next:    nil,
+		net:     nil,
+		entry:   nil,
+	}
+	newCache.cacheTop = firstEntry
+
+	// Initialize remaining entries
+	current := firstEntry
+	for i := 1; i < cacheSize; i++ {
+		next := &cacheEntry[T]{
+			entryid: i,
+			prev:    current,
+			next:    nil,
+			net:     nil,
+			entry:   nil,
+		}
+		current.next = next
+		current = next
+	}
+
+	// Set the bottom of the cache to the last entry
+	newCache.cacheBottom = current
 
 	return &newCache, nil
 }
@@ -66,38 +87,52 @@ func New[T any](getter func(netip.Addr) (T, *net.IPNet), cacheSize int) (*NetCac
 // github.com/oschwald/maxminddb-golang/v2), with the difference being that it
 // uses a cache underneath the hood
 func (c *NetCache[T]) Lookup(ip netip.Addr) T {
-	// Currently there could be reads or writes, so write locking.  Will improve
-	// this later for performance
+	myip := net.IP(ip.AsSlice())
+
+	// Fast path - try read lock first
+	c.mutex.RLock()
+	entry, _, err := c.cacheTree.GetFromIP(myip)
+	if err == nil && entry != nil {
+		cacheEntry := entry.(*cacheEntry[T])
+		if cacheEntry.entry != nil {
+			result := *cacheEntry.entry
+			c.mutex.RUnlock()
+
+			// Async promotion to avoid blocking reads
+			go func() {
+				c.mutex.Lock()
+				c.cacheEntryPromote(cacheEntry)
+				c.mutex.Unlock()
+			}()
+
+			atomic.AddUint64(&c.stats.Hits, 1)
+			return result
+		}
+	}
+	c.mutex.RUnlock()
+
+	// Cache miss path
 	c.mutex.Lock()
 	defer c.mutex.Unlock()
 
-	myip := net.IP(ip.AsSlice())
-
-	entry, _, err := c.cacheTree.GetFromIP(myip)
-	if err != nil || entry.(*cacheEntry[T]) == nil {
-		// fmt.Printf("DEBUG: cache miss: %s\n", ip.String())
-
-		// Either a cache miss, or an error, or both so we will look it up and
-		// add it to the cache
-		result, netRange := c.Getter(ip)
-
-		// And add to the cache
-		err = c.addCacheEntry(result, netRange)
-		if err != nil {
-			fmt.Printf("NOOOOOO, err=[%s]\n", err)
+	// Double-check under write lock
+	entry, _, err = c.cacheTree.GetFromIP(myip)
+	if err == nil && entry != nil {
+		cacheEntry := entry.(*cacheEntry[T])
+		if cacheEntry.entry != nil {
+			atomic.AddUint64(&c.stats.Hits, 1)
+			return *cacheEntry.entry
 		}
-		return result
 	}
 
-	// As we have a cache entry we can simply promote it up the list and return
-	// the value
+	atomic.AddUint64(&c.stats.Misses, 1)
+	result, netRange := c.Getter(ip)
 
-	//fmt.Printf("DEBUG [%d]: cache hit: %s\n", getID(entry.(*cacheEntry)), ip.String())
-	c.cacheEntryPromote(entry.(*cacheEntry[T]))
+	if err := c.addCacheEntry(result, netRange); err != nil {
+		log.Printf("Failed to cache entry: %v", err)
+	}
 
-	returnEntry := entry.(*cacheEntry[T]).entry
-
-	return *returnEntry
+	return result
 }
 
 func (e *cacheEntry[T]) removeEntry() {
@@ -107,73 +142,83 @@ func (e *cacheEntry[T]) removeEntry() {
 }
 
 func (c *NetCache[T]) addCacheEntry(result T, network *net.IPNet) error {
-	// Doesn't matter if it's free or not, we're going to take the bottom of the
-	// cache ranking list, so we can safely just overwrite the data and promote
-	// it
+	if network == nil {
+		return fmt.Errorf("cannot add nil network to cache")
+	}
 
-	var err error
+	// Already holding write lock from Lookup
 
-	// Remove the network from this cache entry from the lookup tree
-	if c.cacheBottom.net != nil {
-		err = c.cacheTree.RemoveNet(c.cacheBottom.net.String())
-		if err != nil {
-			return err
+	if c.cacheBottom == nil {
+		return fmt.Errorf("cache not properly initialized")
+	}
+
+	// Take a copy of the bottom entry while holding the lock
+	oldNetwork := c.cacheBottom.net
+	if oldNetwork != nil {
+		atomic.AddUint64(&c.stats.Evictions, 1)
+		// Remove from tree before modifying the entry
+		if err := c.cacheTree.RemoveNet(oldNetwork.String()); err != nil {
+			log.Printf("failed to remove network: %v", err)
 		}
 	}
 
-	// Remove the contents of the cache entry
-	c.cacheBottom.removeEntry()
-
-	//newCacheEntry := new(cacheEntry[T])
-	//newCacheEntry.entryid = c.cacheBottom.entryid
-	c.cacheBottom.net = new(net.IPNet)
-	c.cacheBottom.net = network
-	c.cacheBottom.entry = new(T)
-	c.cacheBottom.entry = &result
-
-	_, err = c.cacheTree.AddNet(network.String(), c.cacheBottom)
-	if err != nil {
-		return fmt.Errorf("could not add cache entry, err=[%s]", err)
-	}
-
+	// Take the bottom entry
 	newEntry := c.cacheBottom
 
-	// Move the second to last to the bottom
+	// Update the cache bottom
 	c.cacheBottom = c.cacheBottom.prev
-	c.cacheBottom.next = nil
+	if c.cacheBottom != nil {
+		c.cacheBottom.next = nil
+	}
 
+	// Update the entry contents
+	newEntry.net = network
+	newEntry.entry = &result
+
+	// Add to tree
+	_, err := c.cacheTree.AddNet(network.String(), newEntry)
+	if err != nil {
+		return fmt.Errorf("could not add cache entry: %v", err)
+	}
+
+	// Move to top
 	c.cacheEntryPromote(newEntry)
 
 	return nil
 }
 
 func (c *NetCache[T]) cacheEntryPromote(entry *cacheEntry[T]) {
-	if isFirst(entry) {
-		// Already top, so quick return
+	if entry == nil {
 		return
 	}
 
-	// Remove the entry from the linked list
+	// If it's already at the top, nothing to do
+	if entry == c.cacheTop {
+		return
+	}
 
-	// Point the one before, to the one after
+	// Update previous and next links
 	if entry.prev != nil {
 		entry.prev.next = entry.next
 	}
-
-	// And the reverse for the reverse pointer
 	if entry.next != nil {
 		entry.next.prev = entry.prev
 	}
 
-	// The entry is now orphaned from the linked list and can be promoted to the
-	// top
+	// If this was the bottom entry, update bottom pointer
+	if entry == c.cacheBottom {
+		c.cacheBottom = entry.prev
+		if c.cacheBottom != nil {
+			c.cacheBottom.next = nil
+		}
+	}
 
-	// Update the entry's next to the current top item (making it #2)
-	entry.next = c.cacheTop
-	// Remove the previous, because there isn't one
+	// Move to top
 	entry.prev = nil
-
-	// Update the cache top to point to this entry as the new top
+	entry.next = c.cacheTop
+	if c.cacheTop != nil {
+		c.cacheTop.prev = entry
+	}
 	c.cacheTop = entry
 }
 
@@ -197,4 +242,39 @@ func getID[T any](entry *cacheEntry[T]) int {
 	} else {
 		return entry.entryid
 	}
+}
+
+// GetStats returns the current cache statistics atomically
+func (c *NetCache[T]) GetStats() CacheStats {
+	return CacheStats{
+		Hits:      atomic.LoadUint64(&c.stats.Hits),
+		Misses:    atomic.LoadUint64(&c.stats.Misses),
+		Evictions: atomic.LoadUint64(&c.stats.Evictions),
+	}
+}
+
+// GetHits returns the number of cache hits
+func (c *NetCache[T]) GetHits() uint64 {
+	return atomic.LoadUint64(&c.stats.Hits)
+}
+
+// GetMisses returns the number of cache misses
+func (c *NetCache[T]) GetMisses() uint64 {
+	return atomic.LoadUint64(&c.stats.Misses)
+}
+
+// GetEvictions returns the number of cache evictions
+func (c *NetCache[T]) GetEvictions() uint64 {
+	return atomic.LoadUint64(&c.stats.Evictions)
+}
+
+// GetHitRate returns the cache hit rate as a percentage
+func (c *NetCache[T]) GetHitRate() float64 {
+	hits := c.GetHits()
+	misses := c.GetMisses()
+	total := hits + misses
+	if total == 0 {
+		return 0
+	}
+	return float64(hits) / float64(total) * 100
 }
